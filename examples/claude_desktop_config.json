@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "loftbox": {
+      "command": "npx",
+      "args": ["-y", "@loftbox/mcp"],
+      "env": {
+        "LOFTBOX_API_KEY": "lb_live_your_key_here"
+      }
+    }
+  }
+}
