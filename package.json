@@ -1,0 +1,46 @@
+{
+  "name": "@loftbox/mcp",
+  "version": "0.1.0",
+  "description": "LoftBox MCP server — email infrastructure admin plane for AI agents (mailboxes, domains, messaging, HITL approval queue)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TheMagicTower/loftbox-mcp.git"
+  },
+  "homepage": "https://loftbox.net",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "email",
+    "ai-agents",
+    "loftbox",
+    "smtp",
+    "inbox"
+  ],
+  "type": "module",
+  "bin": {
+    "loftbox-mcp": "dist/index.js"
+  },
+  "files": ["dist", "README.md", "LICENSE"],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "format:check": "prettier --check \"src/**/*.ts\" \"tests/**/*.ts\"",
+    "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\"",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "prettier": "^3",
+    "tsx": "^4",
+    "typescript": "^5"
+  }
+}
