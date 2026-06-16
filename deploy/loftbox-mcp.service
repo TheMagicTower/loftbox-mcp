@@ -1,0 +1,21 @@
+# /etc/systemd/system/loftbox-mcp.service — 원격 MCP RS (Streamable HTTP, api_key bearer).
+# deploy/DEPLOY.md 가 source-of-truth. VPS 직접 핫픽스 금지.
+[Unit]
+Description=LoftBox remote MCP server (Streamable HTTP, api_key bearer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/loftbox-mcp
+# 127.0.0.1 바인딩 — Caddy 가 mcp.loftbox.net→여기 TLS 프록시(공개 노출 아님).
+Environment=LOFTBOX_MCP_PORT=3100
+Environment=LOFTBOX_MCP_HOST=127.0.0.1
+# 같은 박스 loftbox-api 내부 호출(공개 TLS 의존 회피). 키 검증은 다운스트림 api.
+Environment=LOFTBOX_BASE_URL=http://localhost:8080
+ExecStart=/usr/bin/node /opt/loftbox-mcp/dist/http.js
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

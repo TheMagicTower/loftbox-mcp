@@ -1,0 +1,5 @@
+# /etc/caddy/Caddyfile 에 추가하는 블록 — mcp.loftbox.net → 로컬 MCP RS.
+# Caddy 가 Let's Encrypt 인증서 자동 발급(tls-alpn-01). DNS: mcp.loftbox.net A → VPS IP (Cloudflare, DNS-only/proxied=false — Caddy LE 위해).
+mcp.loftbox.net {
+    reverse_proxy localhost:3100
+}
