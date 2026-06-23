@@ -1,0 +1,33 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.json",
+  "name": "io.github.themagictower/loftbox-mcp",
+  "description": "Email infrastructure for AI agents: mailboxes, domains/DNS, messaging, webhooks, and a human-in-the-loop approval queue — the LoftBox admin plane as MCP tools.",
+  "version": "0.1.0",
+  "repository": {
+    "url": "https://github.com/TheMagicTower/loftbox-mcp",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@loftbox/mcp",
+      "version": "0.1.0",
+      "transport": { "type": "stdio" },
+      "environmentVariables": [
+        {
+          "name": "LOFTBOX_API_KEY",
+          "description": "LoftBox API key (lb_...). Required. Create one at https://loftbox.net",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "LOFTBOX_BASE_URL",
+          "description": "LoftBox API base URL. Optional; defaults to https://api.loftbox.net",
+          "isRequired": false,
+          "default": "https://api.loftbox.net"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+# Smithery 배포 설정 (smithery.ai) — stdio MCP 서버.
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    required: ["loftboxApiKey"]
+    properties:
+      loftboxApiKey:
+        type: string
+        title: LoftBox API Key
+        description: "LoftBox API key (lb_...). Create one at https://loftbox.net"
+      loftboxBaseUrl:
+        type: string
+        title: API Base URL
+        description: "Optional. Defaults to https://api.loftbox.net"
+        default: "https://api.loftbox.net"
+  commandFunction: |-
+    (config) => ({
+      command: "npx",
+      args: ["-y", "@loftbox/mcp"],
+      env: Object.assign(
+        { LOFTBOX_API_KEY: config.loftboxApiKey },
+        config.loftboxBaseUrl ? { LOFTBOX_BASE_URL: config.loftboxBaseUrl } : {}
+      )
+    })
