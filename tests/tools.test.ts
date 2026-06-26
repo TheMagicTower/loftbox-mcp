@@ -6,7 +6,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 import { LoftBoxApi, ApiError } from "../src/api.js";
-import { TOOLS } from "../src/tools.js";
+import { TOOLS, guardMessage, guardPage } from "../src/tools.js";
 import { invokeTool, describeError, createServer } from "../src/server.js";
 
 type Handler = (req: Request) => Response | Promise<Response>;
@@ -581,5 +581,89 @@ describe("오류 매핑", () => {
 
   it("describeError — 401 안내", () => {
     assert.match(describeError(new ApiError(401, "nope")), /API 키/);
+  });
+});
+
+describe("인바운드 인젝션 가드 (#369/#370)", () => {
+  it("guardMessage — 고위험은 _safety_warning 주입(제목 보존)", () => {
+    const out: any = guardMessage(
+      {
+        id: "m1",
+        subject: "hi",
+        injection_score: 0.92,
+        injection_categories: ["instruction_override"],
+      },
+      0.7,
+      false,
+    );
+    assert.match(out._safety_warning, /신뢰불가/);
+    assert.match(out._safety_warning, /instruction_override/);
+    assert.equal(out.subject, "hi");
+  });
+
+  it("guardMessage — 저위험/미채점/발신은 동일 객체 무변경", () => {
+    const low = { id: "m1", injection_score: 0.1 };
+    assert.equal(guardMessage(low, 0.7, false), low);
+    const none = { id: "m2" };
+    assert.equal(guardMessage(none, 0.7, false), none);
+  });
+
+  it("guardMessage — strict 모드는 제목/본문 차단", () => {
+    const out: any = guardMessage(
+      {
+        id: "m1",
+        subject: "secret",
+        body_text: "x",
+        body_html: "<b>x</b>",
+        injection_score: 0.9,
+      },
+      0.7,
+      true,
+    );
+    assert.equal(out.subject, "[차단됨: 인젝션 위험]");
+    assert.equal(out.body_text, null);
+    assert.equal(out.body_html, null);
+    assert.match(out._safety_warning, /위험/);
+  });
+
+  it("guardPage — 각 메시지에 적용, next_cursor 보존", () => {
+    const p = guardPage(
+      {
+        data: [
+          {
+            id: "m1",
+            injection_score: 0.95,
+            injection_categories: ["role_hijack"],
+          },
+          { id: "m2", injection_score: 0.0 },
+        ],
+        next_cursor: "c",
+      },
+      0.7,
+      false,
+    );
+    assert.match((p.data[0] as any)._safety_warning, /role_hijack/);
+    assert.equal((p.data[1] as any)._safety_warning, undefined);
+    assert.equal(p.next_cursor, "c");
+  });
+
+  it("inbox_list — 고위험 수신메일에 _safety_warning 부착", async () => {
+    const { result } = await callOnce(
+      "inbox_list",
+      { mailbox_id: "mb_1" },
+      async () =>
+        json({
+          data: [
+            {
+              id: "in_1",
+              subject: "hi",
+              injection_score: 0.9,
+              injection_categories: ["tool_injection"],
+            },
+          ],
+          next_cursor: null,
+        }),
+    );
+    assert.match(result.data[0]._safety_warning, /tool_injection/);
   });
 });
