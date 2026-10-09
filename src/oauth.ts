@@ -45,7 +45,9 @@ import {
   isNonNilUuid,
   isValidChallenge,
   isValidVerifier,
+  normalizeIp,
   parseScopeParam,
+  rightmostForwardedIp,
   validateRedirectUri,
   type OAuthConfig,
 } from "./oauth-config.js";
@@ -152,8 +154,13 @@ export async function validateKeyWithApi(apiKey: string): Promise<AuthContext> {
       {
         headers: { Authorization: `Bearer ${apiKey}` },
         signal: controller.signal,
+        // Authorization 이 Location 목적지로 따라가지 않게 수동 처리.
+        redirect: "manual",
       },
     );
+    // 모든 3xx 는 리다이렉트를 절대 따라가지 않고 502 실패로 취급한다 —
+    // same-origin 포함, Location 목적지에 요청을 보내지 않는다.
+    if (res.status >= 300 && res.status <= 399) return failed(502);
     if (res.status === 401 || res.status === 403) return failed(res.status);
     if (!res.ok) return failed(res.status);
     let body: unknown;
@@ -510,9 +517,24 @@ export class OAuthBroker {
 
   /* ─── 가드 ─────────────────────────────────────────────── */
 
+  /** OAuth 전용 속도 제한 버킷 키. 실제 소켓 피어가 명시적 신뢰
+   *  프록시 목록에 있을 때만 X-Forwarded-For 우측 IP 를 쓰고, 그 외에는
+   *  항상 실제 소켓 피어로 버킷한다. 헤더 존재·루프백만으로는 절대
+   *  신뢰하지 않는다. host/origin/issuer/auth/context/MCP 판정과 무관. */
+  private rateBucketKey(req: IncomingMessage): string {
+    const socketRaw = req.socket.remoteAddress ?? "unknown";
+    const socketIp = normalizeIp(socketRaw);
+    const socketKey = socketIp ?? socketRaw.slice(0, 128);
+    if (socketIp !== null && this.config.trustedProxyIps.includes(socketIp)) {
+      const fwd = rightmostForwardedIp(req.headers["x-forwarded-for"]);
+      if (fwd !== null) return fwd;
+    }
+    return socketKey;
+  }
+
   /** 베스트 에포트 IP 속도 제한. 초과 시 false. */
   checkRate(req: IncomingMessage): boolean {
-    const ip = (req.socket.remoteAddress ?? "unknown").slice(0, 128);
+    const ip = this.rateBucketKey(req);
     const now = Date.now();
     const cur = this.rate.get(ip);
     if (!cur || cur.reset <= now) {

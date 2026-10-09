@@ -50,6 +50,7 @@ LOFTBOX_API_KEY=lb_live_xxx npx -y @loftbox/mcp
 | `LOFTBOX_MCP_PUBLIC_URL` | OAuth 시 ✅ | — | 신뢰 HTTPS 공개 origin(예: `https://mcp.loftbox.net`). |
 | `LOFTBOX_MCP_OAUTH_ENCRYPTION_KEY` | OAuth 시 ✅ | — | 32바이트 base64 암호화 비밀(운영자 별도 주입). |
 | `LOFTBOX_MCP_OAUTH_STORE` | OAuth 시 ✅ | — | durable 저장소 절대 경로(`/opt/loftbox-mcp` 밖). |
+| `LOFTBOX_MCP_OAUTH_TRUSTED_PROXY_IPS` | | (미설정=신뢰 없음) | OAuth 속도 제한용 신뢰 프록시 exact IP(쉼표 구분, 기존 Caddy 루프백은 `127.0.0.1`). |
 
 ## 연결 예제 (로컬 체크아웃, ENV 플레이스홀더)
 
@@ -141,7 +142,8 @@ export LOFTBOX_MCP_OAUTH_ENABLED=true
 export LOFTBOX_MCP_PUBLIC_URL=https://mcp.loftbox.net
 export LOFTBOX_BASE_URL=http://localhost:8080
 export LOFTBOX_MCP_OAUTH_ENCRYPTION_KEY='<32바이트-base64-비밀>'
-export LOFTBOX_MCP_OAUTH_STORE=/var/lib/loftbox-mcp/oauth-store.json
+export LOFTBOX_MCP_OAUTH_STORE=/var/lib/loftbox-mcp/oauth/store.json
+export LOFTBOX_MCP_OAUTH_TRUSTED_PROXY_IPS=127.0.0.1
 node dist/http.js
 # /health → oauth_enabled:true, /setup → 연결 안내
 ```
@@ -154,6 +156,17 @@ node dist/http.js
 신규 등록·회전은 503 으로 거부되며 기존 grant 는 유지된다(유효 기록
 추방 없음). 암호화 키 교체 시 기존 승인은 다시 받아야 한다(재승인 필요).
 백업·복구와 Caddy/배포 절차는 `deploy/DEPLOY.md` 를 본다.
+
+OAuth 속도 제한은 기본적으로 실제 소켓 피어 IP 로 버킷하므로, 기존
+Caddy → `127.0.0.1:3100` 구성에서는 명시적 등록이 없으면 모든 사용자가
+한 버킷에 묶인다. 운영자는 `LOFTBOX_MCP_OAUTH_TRUSTED_PROXY_IPS=127.0.0.1`
+로 직접 프록시를 등록한다 — 이때만 신뢰 소켓 뒤 `X-Forwarded-For`
+우측 IP 로 클라이언트를 분리한다(공식 Caddy `reverse_proxy` 가
+설정·추가하는 헤더이며 수신된 미신뢰 전달값은 무시된다). 목록에 없는
+소켓·루프백은 헤더 존재와 무관하게 절대 신뢰하지 않고, 비정상 헤더는
+소켓 폴백한다. 형식 위반(호스트명·CIDR·빈 항목·초과) 시 기동이 중단된다.
+이 설정은 OAuth 속도 제한에만 영향을 주고 host/origin/issuer/auth/context
+및 MCP 트래픽 판정에는 쓰지 않는다.
 
 ## 툴 (28 + 관리 17)
 

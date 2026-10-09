@@ -50,17 +50,21 @@ API 키 승인 브로커. **실제 운영 OAuth 동작과 실제 클라이언트
    `LOFTBOX_MCP_OAUTH_ENABLED=true`,
    `LOFTBOX_MCP_PUBLIC_URL=https://mcp.loftbox.net`,
    `LOFTBOX_MCP_OAUTH_ENCRYPTION_KEY=<위 비밀>`,
-   `LOFTBOX_MCP_OAUTH_STORE=/var/lib/loftbox-mcp/oauth-store.json`.
+   `LOFTBOX_MCP_OAUTH_STORE=/var/lib/loftbox-mcp/oauth/store.json`,
+   `LOFTBOX_MCP_OAUTH_TRUSTED_PROXY_IPS=127.0.0.1`
+   (기존 Caddy 루프백 직접 프록시 — OAuth 속도 제한 클라이언트 분리용,
+   형식은 `deploy/oauth.env.example` 참고).
 3. 저장소 디렉터리 준비(0700, 서비스 사용자 소유, `/opt/loftbox-mcp` 밖 —
    deploy.sh 가 `/opt/loftbox-mcp` 를 삭제한다):
-   `mkdir -p /var/lib/loftbox-mcp && chmod 700 /var/lib/loftbox-mcp`.
+   `mkdir -p /var/lib/loftbox-mcp/oauth && chmod 700 /var/lib/loftbox-mcp /var/lib/loftbox-mcp/oauth`.
    공유/타인 소유/심볼릭 링크 경로는 기동 시 거부된다.
 4. `deploy.sh` 로 배포(유닛의 `EnvironmentFile=-...` 가 비밀을 읽음) 후
    `systemctl restart loftbox-mcp`.
 5. 검증: `curl https://mcp.loftbox.net/health` → `oauth_enabled:true`;
    `/.well-known/oauth-protected-resource`·`/mcp` 가 canonical resource 와
    동일 issuer 를 가리키는지 확인. Caddy 변경 불필요(기존 프록시 유지,
-   Host 전달 전제).
+   Host 전달 전제 — `reverse_proxy` 가 설정·추가하는 `X-Forwarded-For` 를
+   신뢰 목록(`127.0.0.1`) 소켓 뒤에서만 속도 제한 분리용으로 읽는다).
 
 제약·운영 주의:
 

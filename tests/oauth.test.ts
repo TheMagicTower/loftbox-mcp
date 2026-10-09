@@ -11,6 +11,7 @@ import { createHash, randomBytes } from "node:crypto";
 import {
   createServer as createHttpServer,
   request as httpRequest,
+  type IncomingMessage,
   type Server,
 } from "node:http";
 import {
@@ -37,8 +38,16 @@ import {
   parseStore,
   sha256Hex,
 } from "../src/oauth-store.js";
-import { OAuthBroker, type AuthContext } from "../src/oauth.js";
-import { loadOAuthConfig } from "../src/oauth-config.js";
+import {
+  OAuthBroker,
+  validateKeyWithApi,
+  type AuthContext,
+} from "../src/oauth.js";
+import {
+  loadOAuthConfig,
+  normalizeIp,
+  RATE_LIMIT_MAX,
+} from "../src/oauth-config.js";
 
 // 합성 테스트는 로컬 루프백만 사용 — 샌드박스 프록시 경유 금지(결정적 실행).
 for (const k of ["NO_PROXY", "no_proxy"]) {
@@ -70,6 +79,7 @@ const OAUTH_ENV_KEYS = [
   "LOFTBOX_MCP_PUBLIC_URL",
   "LOFTBOX_MCP_OAUTH_ENCRYPTION_KEY",
   "LOFTBOX_MCP_OAUTH_STORE",
+  "LOFTBOX_MCP_OAUTH_TRUSTED_PROXY_IPS",
   "LOFTBOX_BASE_URL",
   "LOFTBOX_MCP_READ_ONLY",
 ] as const;
@@ -3424,5 +3434,397 @@ describe("OAuth WWW-Authenticate 정확 규격", () => {
     } finally {
       await close2();
     }
+  });
+});
+
+describe("OAuth 키 검증 리다이렉트 차단", () => {
+  interface Trap {
+    url: string;
+    hits: number;
+    authz: string[];
+    close: () => Promise<void>;
+  }
+
+  async function startTrap(): Promise<Trap> {
+    const t: Trap = {
+      url: "",
+      hits: 0,
+      authz: [],
+      close: async () => {},
+    };
+    const server: Server = createHttpServer((req, res) => {
+      t.hits += 1;
+      t.authz.push(req.headers.authorization ?? "");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ trapped: true }));
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const addr = server.address() as AddressInfo;
+    t.url = `http://127.0.0.1:${addr.port}`;
+    t.close = () =>
+      new Promise<void>((resolve, reject) =>
+        server.close((e) => (e ? reject(e) : resolve())),
+      );
+    return t;
+  }
+
+  it("모든 3xx 는 502 실패 — Location 을 절대 따라가지 않음", async () => {
+    const trap = await startTrap();
+    // 리다이렉트 응답 API — 상태·Location 을 테스트가 지정한다.
+    let mode: { status: number; location: string } = {
+      status: 302,
+      location: `${trap.url}/grab`,
+    };
+    let apiHits = 0;
+    const api: Server = createHttpServer((req, res) => {
+      const path = (req.url ?? "").split("?")[0];
+      if (path === "/v1/auth/context") {
+        apiHits += 1;
+        res.writeHead(mode.status, { location: mode.location });
+        res.end();
+        return;
+      }
+      // same-origin 트랩 경로 — 도달하면 실패.
+      trap.hits += 1;
+      trap.authz.push(req.headers.authorization ?? "");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ trapped: true }));
+    });
+    await new Promise<void>((resolve) => api.listen(0, "127.0.0.1", resolve));
+    const addr = api.address() as AddressInfo;
+    const base = `http://127.0.0.1:${addr.port}`;
+    const closeApi = () =>
+      new Promise<void>((resolve, reject) =>
+        api.close((e) => (e ? reject(e) : resolve())),
+      );
+    try {
+      process.env.LOFTBOX_BASE_URL = base;
+      // 대표 리다이렉트 상태 + 경계(300·399).
+      for (const status of [300, 301, 302, 303, 307, 308, 399]) {
+        // 외부 목적지.
+        trap.hits = 0;
+        trap.authz = [];
+        mode = { status, location: `${trap.url}/grab-${status}` };
+        const r1 = await validateKeyWithApi(TEST_KEY);
+        assert.equal(r1.ok, false, `status ${status}`);
+        assert.equal(r1.status, 502, `status ${status}`);
+        assert.equal(trap.hits, 0, `trap 무요청 ${status}`);
+        assert.deepEqual(trap.authz, [], `Authorization 유출 없음 ${status}`);
+        // same-origin 목적지 — 역시 따라가지 않는다.
+        trap.hits = 0;
+        trap.authz = [];
+        mode = { status, location: `/same-origin-trap-${status}` };
+        const r2 = await validateKeyWithApi(TEST_KEY);
+        assert.equal(r2.ok, false, `same-origin ${status}`);
+        assert.equal(r2.status, 502, `same-origin ${status}`);
+        assert.equal(trap.hits, 0, `same-origin trap 무요청 ${status}`);
+      }
+      assert.ok(apiHits > 0, "설정된 base URL 로 요청 전송 확인");
+    } finally {
+      await closeApi();
+      await trap.close();
+    }
+  });
+
+  it("정상 200 형태·401/403 동작 유지", async () => {
+    const api = await startFakeApi();
+    try {
+      process.env.LOFTBOX_BASE_URL = api.url;
+      const ok = await validateKeyWithApi(TEST_KEY);
+      assert.equal(ok.ok, true);
+      assert.equal(ok.status, 200);
+      assert.equal(ok.org_id, UUID_ORG_1);
+      assert.equal(ok.key_id, UUID_KEY_1);
+      assert.ok(ok.effective_scopes.length > 0);
+      const denied = await validateKeyWithApi("lb_invalid_key");
+      assert.equal(denied.ok, false);
+      assert.equal(denied.status, 401);
+    } finally {
+      await api.close();
+    }
+    // 403 변형.
+    const s403: Server = createHttpServer((_req, res) => {
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "forbidden" }));
+    });
+    await new Promise<void>((resolve) => s403.listen(0, "127.0.0.1", resolve));
+    const addr = s403.address() as AddressInfo;
+    try {
+      process.env.LOFTBOX_BASE_URL = `http://127.0.0.1:${addr.port}`;
+      const f = await validateKeyWithApi(TEST_KEY);
+      assert.equal(f.ok, false);
+      assert.equal(f.status, 403);
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        s403.close((e) => (e ? reject(e) : resolve())),
+      );
+    }
+  });
+});
+
+describe("OAuth 신뢰 프록시 속도제한", () => {
+  function directBroker(trusted?: string): OAuthBroker {
+    const storePath = enableOAuth();
+    if (trusted !== undefined) {
+      process.env.LOFTBOX_MCP_OAUTH_TRUSTED_PROXY_IPS = trusted;
+    }
+    const config = loadOAuthConfig(process.env, {
+      allowInsecureLoopback: true,
+    })!;
+    return new OAuthBroker(config, FileOAuthStore.open(storePath));
+  }
+
+  function fakeReq(
+    remoteAddress: string | undefined,
+    xff?: string | string[],
+  ): IncomingMessage {
+    return {
+      socket: { remoteAddress },
+      headers: xff === undefined ? {} : { "x-forwarded-for": xff },
+    } as unknown as IncomingMessage;
+  }
+
+  function exhaust(
+    broker: OAuthBroker,
+    req: IncomingMessage,
+    n: number = RATE_LIMIT_MAX,
+  ): void {
+    for (let i = 0; i < n; i++) {
+      assert.equal(broker.checkRate(req), true, `통과 ${i + 1}/${n}`);
+    }
+    assert.equal(broker.checkRate(req), false, "상한 초과 거부");
+  }
+
+  it("기본값은 빈 신뢰 목록 — XFF 로 버킷 변경 불가", () => {
+    const storePath = enableOAuth();
+    const config = loadOAuthConfig(process.env, {
+      allowInsecureLoopback: true,
+    })!;
+    assert.deepEqual(config.trustedProxyIps, []);
+    const broker = new OAuthBroker(config, FileOAuthStore.open(storePath));
+    // 회전 XFF 로도 회피 불가 — 모두 같은 소켓 버킷.
+    for (let i = 0; i < RATE_LIMIT_MAX; i++) {
+      const r = fakeReq("10.9.9.9", `203.0.113.${(i % 250) + 1}`);
+      assert.equal(broker.checkRate(r), true, `통과 ${i + 1}`);
+    }
+    assert.equal(
+      broker.checkRate(fakeReq("10.9.9.9", "203.0.113.250")),
+      false,
+      "회전 XFF 도 같은 버킷 상한",
+    );
+    // 다른 소켓 피어는 영향 없음.
+    assert.equal(broker.checkRate(fakeReq("10.9.9.10")), true);
+  });
+
+  it("미신뢰 직접 피어는 타인 버킷에 영향 불가", () => {
+    const broker = directBroker();
+    // 공격자가 피해자 IP 를 XFF 로 주장해도 피해자 버킷 untouched.
+    exhaust(broker, fakeReq("198.51.100.99", "198.51.100.7"));
+    assert.equal(
+      broker.checkRate(fakeReq("198.51.100.7")),
+      true,
+      "피해자 소켓 버킷 독립",
+    );
+    assert.equal(
+      broker.checkRate(fakeReq("198.51.100.99")),
+      false,
+      "공격자 소켓 버킷 소진 유지",
+    );
+  });
+
+  it("신뢰 127.0.0.1 뒤 두 전달 클라이언트 독립 한도", () => {
+    const broker = directBroker("127.0.0.1");
+    exhaust(broker, fakeReq("127.0.0.1", "203.0.113.1"));
+    // 한 클라이언트 소진이 다른 클라이언트를 막지 않는다.
+    assert.equal(
+      broker.checkRate(fakeReq("127.0.0.1", "203.0.113.2")),
+      true,
+      "두 번째 전달 클라이언트 독립",
+    );
+    exhaust(broker, fakeReq("127.0.0.1", "203.0.113.2"), RATE_LIMIT_MAX - 1);
+    // 소켓 mapped 형태(::ffff:127.0.0.1)도 같은 신뢰 프록시.
+    exhaust(broker, fakeReq("::ffff:127.0.0.1", "198.51.100.7"));
+    assert.equal(
+      broker.checkRate(fakeReq("::ffff:127.0.0.1", "198.51.100.8")),
+      true,
+      "mapped 소켓 뒤 다른 클라이언트 독립",
+    );
+  });
+
+  it("스푸핑된 좌측 체인값은 우측 클라이언트 버킷 이동 불가", () => {
+    const broker = directBroker("127.0.0.1");
+    // 좌측이 달라도 우측이 같으면 같은 버킷.
+    for (let i = 0; i < RATE_LIMIT_MAX; i++) {
+      const left = i % 2 === 0 ? "1.2.3.4" : "9.9.9.9, 8.8.8.8";
+      assert.equal(
+        broker.checkRate(fakeReq("127.0.0.1", `${left}, 203.0.113.9`)),
+        true,
+      );
+    }
+    assert.equal(
+      broker.checkRate(fakeReq("127.0.0.1", "203.0.113.9")),
+      false,
+      "우측 IP 단일 표기도 같은 버킷",
+    );
+    assert.equal(
+      broker.checkRate(fakeReq("127.0.0.1", "7.7.7.7, 203.0.113.9")),
+      false,
+      "좌측 변경으로 회피 불가",
+    );
+    // 우측이 다르면 다른 버킷 — 좌측에 소진된 IP 가 있어도 통과.
+    assert.equal(
+      broker.checkRate(fakeReq("127.0.0.1", "203.0.113.9, 198.51.100.8")),
+      true,
+      "우측 IP 가 버킷 결정",
+    );
+  });
+
+  it("비정상 XFF 는 소켓 폴백 — 상한 회피 불가", () => {
+    const broker = directBroker("127.0.0.1");
+    const bad: Array<string | string[]> = [
+      "not-an-ip",
+      "",
+      "   ",
+      ["203.0.113.5"],
+      ["203.0.113.5", "203.0.113.6"],
+      "203.0.113.5, ",
+      ",203.0.113.5,",
+      "999.1.1.1",
+      "proxy.local",
+      "10.0.0.0/8",
+      "[::1]",
+      "1.2.3.4:5678",
+      `203.0.113.5,${"9.9.9.9,".repeat(40)}203.0.113.6`,
+      "x".repeat(3000),
+    ];
+    // 비정상 헤더들을 섞어 소켓 버킷을 채운다 — 각각 새 버킷이면 안 된다.
+    for (let i = 0; i < RATE_LIMIT_MAX; i++) {
+      const h = bad[i % bad.length]!;
+      assert.equal(
+        broker.checkRate(fakeReq("127.0.0.1", h)),
+        true,
+        `통과 ${i}`,
+      );
+    }
+    assert.equal(
+      broker.checkRate(fakeReq("127.0.0.1")),
+      false,
+      "헤더 없음도 같은 소켓 버킷",
+    );
+    assert.equal(
+      broker.checkRate(fakeReq("127.0.0.1", "still-bad")),
+      false,
+      "비정상 헤더도 소진된 소켓 버킷",
+    );
+    // 정상 전달 클라이언트는 독립 버킷으로 통과.
+    assert.equal(
+      broker.checkRate(fakeReq("127.0.0.1", "203.0.113.44")),
+      true,
+      "정상 전달 클라이언트 독립",
+    );
+  });
+
+  it("IPv6 정규화 — 표기 달라도 같은 신뢰·버킷", () => {
+    assert.equal(normalizeIp("::ffff:127.0.0.1"), "127.0.0.1");
+    assert.equal(normalizeIp("::FFFF:192.0.2.1"), "192.0.2.1");
+    // IPv4-mapped — dotted/hex/full 표기 모두 같은 IPv4 로 수렴.
+    assert.equal(normalizeIp("::ffff:7f00:1"), "127.0.0.1");
+    assert.equal(normalizeIp("::FFFF:7F00:1"), "127.0.0.1");
+    assert.equal(normalizeIp("0:0:0:0:0:ffff:127.0.0.1"), "127.0.0.1");
+    assert.equal(normalizeIp("0:0:0:0:0:ffff:7f00:1"), "127.0.0.1");
+    assert.equal(normalizeIp("::ffff:c000:201"), "192.0.2.1");
+    assert.equal(normalizeIp("2001:DB8::1"), "2001:db8::1");
+    assert.equal(
+      normalizeIp("2001:0db8:0000:0000:0000:0000:0000:0001"),
+      "2001:db8::1",
+    );
+    assert.equal(normalizeIp("proxy.local"), null);
+    assert.equal(normalizeIp("10.0.0.0/8"), null);
+    assert.equal(normalizeIp(""), null);
+    // 설정 대문자 ↔ 소켓 풀표기 — 같은 프록시로 신뢰된다.
+    const broker = directBroker("2001:DB8::1");
+    exhaust(
+      broker,
+      fakeReq("2001:0db8:0000:0000:0000:0000:0000:0001", "2001:DB8::9"),
+    );
+    assert.equal(
+      broker.checkRate(
+        fakeReq("2001:db8::1", "2001:0db8:0000:0000:0000:0000:0000:0009"),
+      ),
+      false,
+      "전달 클라이언트 표기 달라도 같은 버킷",
+    );
+    assert.equal(
+      broker.checkRate(fakeReq("2001:db8::1", "2001:db8::10")),
+      true,
+      "다른 전달 클라이언트 독립",
+    );
+    // 설정 hex-mapped ↔ 소켓 mapped-dotted/IPv4 — 같은 프록시로 신뢰된다.
+    const mapped = directBroker("::ffff:7f00:1");
+    exhaust(mapped, fakeReq("::ffff:127.0.0.1", "203.0.113.55"));
+    assert.equal(
+      mapped.checkRate(fakeReq("127.0.0.1", "203.0.113.55")),
+      false,
+      "소켓 표기 달라도 같은 전달 클라이언트 버킷",
+    );
+    assert.equal(
+      mapped.checkRate(fakeReq("::ffff:7f00:1", "203.0.113.55")),
+      false,
+      "소켓 hex-mapped 표기도 같은 버킷",
+    );
+    assert.equal(
+      mapped.checkRate(fakeReq("127.0.0.1", "203.0.113.56")),
+      true,
+      "다른 전달 클라이언트 독립",
+    );
+    // 전달 클라이언트 mapped-hex vs dotted — 같은 버킷을 소모한다.
+    exhaust(mapped, fakeReq("127.0.0.1", "::ffff:c000:201"));
+    assert.equal(
+      mapped.checkRate(fakeReq("127.0.0.1", "192.0.2.1")),
+      false,
+      "전달 hex-mapped 와 IPv4 점표기 같은 버킷",
+    );
+    assert.equal(
+      mapped.checkRate(fakeReq("127.0.0.1", "::ffff:192.0.2.1")),
+      false,
+      "전달 hex-mapped 와 mapped-dotted 같은 버킷",
+    );
+  });
+
+  it("무효 신뢰 프록시 설정은 기동 실패(fail-closed)", () => {
+    const badConfigs = [
+      "proxy.local",
+      "10.0.0.0/8",
+      "127.0.0.1,,10.0.0.2",
+      "127.0.0.1,",
+      ",127.0.0.1",
+      "999.1.1.1",
+      "[::1]",
+      "1.2.3.4:5678",
+      Array.from({ length: 33 }, (_, i) => `10.0.0.${i + 1}`).join(","),
+      `${"10.0.0.1,".repeat(300)}10.0.0.2`,
+    ];
+    for (const trusted of badConfigs) {
+      enableOAuth();
+      process.env.LOFTBOX_MCP_OAUTH_TRUSTED_PROXY_IPS = trusted;
+      assert.throws(
+        () => loadOAuthConfig(process.env, { allowInsecureLoopback: true }),
+        /신뢰|OAuth 설정 오류/,
+        `거부: ${trusted.slice(0, 40)}`,
+      );
+    }
+    // 서버 기동 경로에서도 실패한다.
+    enableOAuth();
+    process.env.LOFTBOX_MCP_OAUTH_TRUSTED_PROXY_IPS = "proxy.local";
+    assert.throws(() => buildHttpServer(), /신뢰|OAuth|oauth|기동/);
+    // 공백뿐인 값은 미설정과 동일(신뢰 없음) — 기동 성공.
+    enableOAuth();
+    process.env.LOFTBOX_MCP_OAUTH_TRUSTED_PROXY_IPS = "   ";
+    const config = loadOAuthConfig(process.env, {
+      allowInsecureLoopback: true,
+    })!;
+    assert.deepEqual(config.trustedProxyIps, []);
   });
 });

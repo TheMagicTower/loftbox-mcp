@@ -6,6 +6,10 @@
  * - LOFTBOX_MCP_OAUTH_ENCRYPTION_KEY: 32바이트 base64 암호화 비밀(별도 보관)
  * - LOFTBOX_MCP_OAUTH_STORE: 절대 경로의 durable 비공개 저장소
  *   (/opt/loftbox-mcp 밖 — deploy.sh 가 그 디렉터리를 삭제한다)
+ * - LOFTBOX_MCP_OAUTH_TRUSTED_PROXY_IPS(선택, 기본 빈 값=신뢰 없음):
+ *   OAuth 속도 제한 버킷용 신뢰 프록시 exact IP(쉼표 구분 숫자 IP만).
+ *   형식 위반 시 기동 중단. 소켓 피어가 목록에 있을 때만
+ *   X-Forwarded-For 우측 IP 를 버킷 키로 쓴다.
  *
  * 활성화 상태에서 설정이 하나라도 유효하지 않으면 예외를 던져 기동을
  * 중단한다(조용한 비활성 폴백 없음). 루프백 HTTP 는 운영 기본값에서 절대
@@ -13,6 +17,7 @@
  * (HttpServerOptions.oauthAllowInsecureLoopback) 켤 수 있다.
  */
 
+import { isIP } from "node:net";
 import { posix } from "node:path";
 
 export const OAUTH_SCOPE_READ = "loftbox.read";
@@ -65,6 +70,14 @@ export const RATE_LIMIT_WINDOW_MS = 60_000;
 export const RATE_LIMIT_MAX = 300;
 export const MAX_RATE_IPS = 5000;
 
+/** 신뢰 프록시 설정 상한 — LOFTBOX_MCP_OAUTH_TRUSTED_PROXY_IPS.
+ *  쉼표 구분 exact 숫자 IP 만 허용(호스트명·CIDR·빈 항목 거부). */
+export const MAX_TRUSTED_PROXY_IPS = 32;
+export const MAX_TRUSTED_PROXY_CONFIG_CHARS = 2048;
+/** X-Forwarded-For 체인 해석 상한 — OAuth 속도 제한 버킷용. */
+export const MAX_XFF_HEADER_CHARS = 2048;
+export const MAX_XFF_ENTRIES = 32;
+
 /** 다운스트림 키 검증 타임아웃. */
 export const KEY_VALIDATION_TIMEOUT_MS = 10_000;
 
@@ -77,6 +90,10 @@ export interface OAuthConfig {
   encryptionKey: Buffer;
   /** durable 저장소 파일 절대 경로. */
   storePath: string;
+  /** 신뢰 프록시 exact IP 목록(정규화 형태, 빈 값=신뢰 없음).
+   *  OAuth 속도 제한 버킷 키에만 사용된다 — host/origin/issuer/auth/
+   *  context/MCP 트래픽 판정에는 절대 쓰지 않는다. */
+  trustedProxyIps: string[];
   /** 테스트 전용: 루프백 HTTP origin/redirect 허용. */
   allowInsecureLoopback: boolean;
   accessTtlSecs: number;
@@ -141,6 +158,89 @@ function parseTtl(
   return value;
 }
 
+/** exact 숫자 IP 를 정규형으로 변환한다. 실패하면 null.
+ *  - IPv4-mapped IPv6(dotted/hex/full 표기 무관) → IPv4 점표기
+ *  - IPv6 → WHATWG URL 직렬화 소문자 압축형
+ *  호스트명·CIDR·포트·브래킷·zone id 는 전부 거부한다. */
+export function normalizeIp(raw: string): string | null {
+  const v = raw.trim();
+  if (v === "" || v.length > 256) return null;
+  if (v.includes("/") || v.includes("%")) return null;
+  if (v.includes("[") || v.includes("]")) return null;
+  if (/\s/.test(v)) return null;
+  const family = isIP(v);
+  if (family === 4) return v;
+  if (family !== 6) return null;
+  let canon: string;
+  try {
+    const host = new URL(`http://[${v.toLowerCase()}]`).hostname;
+    if (!host.startsWith("[") || !host.endsWith("]")) return null;
+    canon = host.slice(1, -1);
+  } catch {
+    return null;
+  }
+  if (isIP(canon) !== 6) return null;
+  // IPv4-mapped → IPv4 점표기. 직렬화 후 canonical 은 입력 표기와 무관하게
+  // 항상 ::ffff:<hex>:<hex> 이므로 한 곳에서만 변환한다.
+  if (canon.startsWith("::ffff:")) {
+    const tail = canon.slice("::ffff:".length);
+    if (tail.includes(".") && isIP(tail) === 4) return tail;
+    const m = /^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(tail);
+    if (m) {
+      const hi = parseInt(m[1]!, 16);
+      const lo = parseInt(m[2]!, 16);
+      return `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+    }
+  }
+  return canon;
+}
+
+/** 신뢰 프록시 뒤 X-Forwarded-For 체인의 우측(가장 가까운 비신뢰
+ *  클라이언트) 숫자 IP 를 정규형으로 반환한다. 누락·배열·초과·빈 값·
+ *  비숫자면 null → 호출자는 소켓 피어로 폴백한다. 사용자 제공 좌측
+ *  값은 절대 쓰지 않는다. */
+export function rightmostForwardedIp(
+  header: string | string[] | undefined,
+): string | null {
+  if (typeof header !== "string") return null;
+  if (header.length === 0 || header.length > MAX_XFF_HEADER_CHARS) return null;
+  const parts = header.split(",");
+  if (parts.length > MAX_XFF_ENTRIES) return null;
+  const last = parts[parts.length - 1]!.trim();
+  if (last === "") return null;
+  return normalizeIp(last);
+}
+
+/** LOFTBOX_MCP_OAUTH_TRUSTED_PROXY_IPS 파싱 — 쉼표 구분 exact 숫자 IP.
+ *  미설정·빈 값이면 [] (신뢰 프록시 없음). 형식 위반·초과는 throw. */
+export function parseTrustedProxyIps(raw: string | undefined): string[] {
+  const v = (raw ?? "").trim();
+  if (v === "") return [];
+  if (v.length > MAX_TRUSTED_PROXY_CONFIG_CHARS) {
+    fail("LOFTBOX_MCP_OAUTH_TRUSTED_PROXY_IPS 설정이 너무 깁니다");
+  }
+  const parts = v.split(",");
+  if (parts.length > MAX_TRUSTED_PROXY_IPS) {
+    fail("LOFTBOX_MCP_OAUTH_TRUSTED_PROXY_IPS 항목이 너무 많습니다");
+  }
+  const out: string[] = [];
+  for (const p of parts) {
+    const t = p.trim();
+    if (t === "") {
+      fail("LOFTBOX_MCP_OAUTH_TRUSTED_PROXY_IPS 에 빈 항목이 있습니다");
+    }
+    const n = normalizeIp(t);
+    if (!n) {
+      fail(
+        "LOFTBOX_MCP_OAUTH_TRUSTED_PROXY_IPS 는 exact 숫자 IP 만 허용합니다 " +
+          "(호스트명·CIDR 불가)",
+      );
+    }
+    out.push(n);
+  }
+  return [...new Set(out)];
+}
+
 /** env + 테스트 오버라이드에서 OAuth 설정을 로드한다.
  *  비활성(false)이면 null 반환. 활성인데 유효하지 않으면 throw. */
 export function loadOAuthConfig(
@@ -201,11 +301,16 @@ export function loadOAuthConfig(
     );
   }
 
+  const trustedProxyIps = parseTrustedProxyIps(
+    env.LOFTBOX_MCP_OAUTH_TRUSTED_PROXY_IPS,
+  );
+
   return {
     publicOrigin,
     resource: `${publicOrigin}/mcp`,
     encryptionKey,
     storePath,
+    trustedProxyIps,
     allowInsecureLoopback,
     accessTtlSecs: parseTtl(
       overrides.accessTtlSecs,
