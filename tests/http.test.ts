@@ -8,6 +8,14 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 
 import { buildHttpServer } from "../src/http.js";
 
+// 로컬 루프백 테스트 — 샌드박스 프록시 경유 금지(결정적 실행).
+for (const k of ["NO_PROXY", "no_proxy"]) {
+  const cur = process.env[k] ?? "";
+  if (!cur.includes("127.0.0.1")) {
+    process.env[k] = cur ? `${cur},127.0.0.1,localhost` : "127.0.0.1,localhost";
+  }
+}
+
 async function startServer(): Promise<{
   port: number;
   close: () => Promise<void>;

@@ -101,6 +101,30 @@ export interface ServerConfig {
   fetch?: typeof fetch;
   /** true 면 readOnlyHint 툴만 등록(쓰기 툴은 SDK 에 미노출). */
   readOnly?: boolean;
+  /** 허용 툴 이름 allowlist — 지정 시 해당 툴만 등록한다(OAuth scope 프로필용).
+   *  readOnly 와 함께 지정되면 둘 다 만족하는 툴만 남는다. */
+  allowedTools?: readonly string[];
+}
+
+/** OAuth scope 에 대응하는 툴 allowlist.
+ *
+ * - `loftbox.read` → readOnlyHint 툴만.
+ * - `loftbox.manage` → 읽기에 더해 *신규 관리 툴(MANAGEMENT_TOOLS)의 쓰기*만
+ *   추가한다. 기존 발송/승인/생성 등 레거시 쓰기는 포함하지 않는다.
+ * - 서버 env `readOnly` 가 true 면 상한으로 적용되어 manage 도 읽기로 축소된다.
+ * 실제 인가는 백엔드 scope 게이트가 수행한다. */
+export function allowedToolsForScope(
+  scope: readonly string[],
+  readOnlyEnv: boolean,
+): string[] {
+  const read = allTools()
+    .filter((t) => t.annotations.readOnlyHint === true)
+    .map((t) => t.name);
+  if (readOnlyEnv || !scope.includes("loftbox.manage")) return read;
+  const mgmtWrites = MANAGEMENT_TOOLS.filter(
+    (t) => t.annotations.readOnlyHint !== true,
+  ).map((t) => t.name);
+  return [...read, ...mgmtWrites];
 }
 
 /** 전체 툴 레지스트리(기존 admin 평면 + 관리 평면). */
@@ -132,9 +156,13 @@ export function createServer(config: ServerConfig): McpServer {
     version: SERVER_VERSION,
   });
 
-  const tools = config.readOnly
+  let tools = config.readOnly
     ? allTools().filter((t) => t.annotations.readOnlyHint === true)
     : allTools();
+  if (config.allowedTools) {
+    const allow = new Set(config.allowedTools);
+    tools = tools.filter((t) => allow.has(t.name));
+  }
   for (const tool of tools) {
     server.registerTool(
       tool.name,

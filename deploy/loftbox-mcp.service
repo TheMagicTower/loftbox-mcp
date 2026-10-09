@@ -13,6 +13,9 @@ Environment=LOFTBOX_MCP_PORT=3100
 Environment=LOFTBOX_MCP_HOST=127.0.0.1
 # 같은 박스 loftbox-api 내부 호출(공개 TLS 의존 회피). 키 검증은 다운스트림 api.
 Environment=LOFTBOX_BASE_URL=http://localhost:8080
+# 브라우저 OAuth 브로커(선택, 기본 비활성). 파일이 없으면 무시(`-` 접두).
+# 활성화는 DEPLOY.md "브라우저 OAuth 활성화" 절차 + 별도 운영 승인 필요.
+EnvironmentFile=-/etc/loftbox-mcp/oauth.env
 ExecStart=/usr/bin/node /opt/loftbox-mcp/dist/http.js
 Restart=on-failure
 RestartSec=5
