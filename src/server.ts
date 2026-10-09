@@ -9,6 +9,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ApiError, LoftBoxApi } from "./api.js";
 import { TOOLS } from "./tools.js";
 import type { ToolDef } from "./tools.js";
+import { MANAGEMENT_TOOLS, SyncConflictError } from "./management-tools.js";
 
 export const SERVER_NAME = "loftbox-mcp";
 export const SERVER_VERSION = "0.1.0";
@@ -25,19 +26,34 @@ export interface ToolResult {
   [key: string]: unknown;
 }
 
-/** ApiError 를 사람이 읽는 MCP 오류 메시지로 변환. */
-export function describeError(e: unknown): string {
+/** ApiError 를 사람이 읽는 MCP 오류 메시지로 변환.
+ *
+ * 403 은 툴의 `requiredScopes` 를 알면 그 fine scope 를 지목한다(막연한
+ * admin 권유 금지). 모르면(기존 툴) 단정 없이 권한 부족 가능성을 안내한다.
+ * 실제 인가는 백엔드 scope/capability 게이트가 수행한다. */
+export function describeError(
+  e: unknown,
+  tool?: Pick<ToolDef, "name" | "requiredScopes">,
+): string {
   if (e instanceof ApiError) {
     const parts = [`LoftBox API 오류 (HTTP ${e.status}): ${e.message}`];
     if (e.status === 401) {
       parts.push("API 키가 유효하지 않습니다 (LOFTBOX_API_KEY 확인).");
     } else if (e.status === 403) {
-      // 403 은 admin scope 부족·org 접근 거부·리소스 소유권·비활성 키 등
-      // 여러 원인이 가능하다. 단정하지 않고 가능성을 안내한다(codex Major).
-      parts.push(
-        "권한이 거부되었습니다. 이 작업에 필요한 권한(예: admin scope) 또는 " +
-          "해당 리소스 접근 권한이 키에 없을 수 있습니다.",
-      );
+      const scopes = tool?.requiredScopes ?? [];
+      if (scopes.length > 0) {
+        parts.push(
+          `권한이 거부되었습니다. 이 툴('${tool!.name}')은 ` +
+            `${scopes.map((s) => `'${s}'`).join(", ")} scope API 키가 필요합니다. ` +
+            "최소권한 키로 재시도하세요(백엔드 scope 게이트가 최종 판정).",
+        );
+      } else {
+        // 403 은 scope 부족·org 접근 거부·리소스 소유권·비활성 키 등
+        // 여러 원인이 가능하다. 단정하지 않고 가능성을 안내한다(codex Major).
+        parts.push(
+          "권한이 거부되었습니다. 이 작업에 필요한 권한이 키에 없을 수 있습니다.",
+        );
+      }
     } else if (e.status === 429 && e.retryAfterSecs != null) {
       parts.push(`${e.retryAfterSecs}초 후 재시도하세요.`);
     }
@@ -62,9 +78,17 @@ export async function invokeTool(
         : JSON.stringify(result, null, 2);
     return { content: [{ type: "text", text }] };
   } catch (e) {
+    // 검증된 sync 충돌 스냅샷: text JSON + structuredContent 로 revision 보존.
+    if (e instanceof SyncConflictError) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: e.message }],
+        structuredContent: { status: e.status, ...e.snapshot },
+      };
+    }
     return {
       isError: true,
-      content: [{ type: "text", text: describeError(e) }],
+      content: [{ type: "text", text: describeError(e, tool) }],
     };
   }
 }
@@ -75,9 +99,26 @@ export interface ServerConfig {
   timeoutMs?: number;
   /** 테스트용 커스텀 fetch. */
   fetch?: typeof fetch;
+  /** true 면 readOnlyHint 툴만 등록(쓰기 툴은 SDK 에 미노출). */
+  readOnly?: boolean;
 }
 
-/** 설정으로 MCP 서버 인스턴스를 만들고 모든 툴을 등록한다(연결은 호출측). */
+/** 전체 툴 레지스트리(기존 admin 평면 + 관리 평면). */
+export function allTools(): ToolDef[] {
+  return [...TOOLS, ...MANAGEMENT_TOOLS];
+}
+
+/** `LOFTBOX_MCP_READ_ONLY=true` 명시 때만 true(기본 전체 등록 유지).
+ *  설정은 서버 env/설정에서만 — 클라이언트 인자로 받지 않는다. */
+export function isReadOnlyFromEnv(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  return (env.LOFTBOX_MCP_READ_ONLY ?? "").trim().toLowerCase() === "true";
+}
+
+/** 설정으로 MCP 서버 인스턴스를 만들고 툴을 등록한다(연결은 호출측).
+ *  `readOnly` 면 annotation-read-only 툴만 등록 — 쓰기 툴은 수동 지명으로도
+ *  호출 불가(SDK 미등록). */
 export function createServer(config: ServerConfig): McpServer {
   const api = new LoftBoxApi({
     apiKey: config.apiKey,
@@ -91,7 +132,10 @@ export function createServer(config: ServerConfig): McpServer {
     version: SERVER_VERSION,
   });
 
-  for (const tool of TOOLS) {
+  const tools = config.readOnly
+    ? allTools().filter((t) => t.annotations.readOnlyHint === true)
+    : allTools();
+  for (const tool of tools) {
     server.registerTool(
       tool.name,
       {

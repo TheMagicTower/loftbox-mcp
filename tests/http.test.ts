@@ -40,6 +40,7 @@ async function startMockApi(
 describe("remote MCP HTTP transport", () => {
   afterEach(() => {
     delete process.env.LOFTBOX_BASE_URL;
+    delete process.env.LOFTBOX_MCP_READ_ONLY;
   });
 
   it("유효 키: initialize → tools/list (stateful 세션)", async () => {
@@ -111,6 +112,58 @@ describe("remote MCP HTTP transport", () => {
       assert.equal(body.status, "ok");
     } finally {
       await close();
+    }
+  });
+
+  it("LOFTBOX_MCP_READ_ONLY=true — HTTP 실전송에서 관리 쓰기 미노출", async () => {
+    const mock = await startMockApi(200);
+    process.env.LOFTBOX_BASE_URL = mock.url;
+    process.env.LOFTBOX_MCP_READ_ONLY = "true";
+    const { port, close } = await startServer();
+    try {
+      const transport = new StreamableHTTPClientTransport(
+        new URL(`http://127.0.0.1:${port}/mcp`),
+        { requestInit: { headers: { Authorization: "Bearer [REDACTED]" } } },
+      );
+      const client = new Client({ name: "test", version: "0.0.0" });
+      await client.connect(transport);
+      try {
+        const { tools } = await client.listTools();
+        const names = tools.map((t) => t.name);
+        assert.ok(names.includes("auth_context"), "읽기 노출");
+        assert.ok(names.includes("marketing_capability"), "읽기 노출");
+        for (const w of [
+          "api_key_revoke",
+          "domain_verify",
+          "domain_remove",
+          "marketing_audience_create",
+          "marketing_sender_profile_create",
+          "marketing_sender_profile_disable",
+          "newsletter_subscription_sync",
+        ]) {
+          assert.ok(!names.includes(w), `HTTP read-only 에서 ${w} 숨김 필요`);
+        }
+        // 숨김 쓰기 수동 지명 호출도 거부(API 호출 없음, isError).
+        const res: any = await client.callTool({
+          name: "newsletter_subscription_sync",
+          arguments: {
+            audience_public_id: "aud_1",
+            email_hash: "a".repeat(64),
+            email: "user@example.com",
+            source: "homepage",
+            source_revision: 1,
+            expected_version: 0,
+            action: "unsubscribe",
+            confirmed: true,
+          },
+        });
+        assert.equal(res.isError, true, "숨김 쓰기는 isError");
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await close();
+      await mock.close();
     }
   });
 });

@@ -20,6 +20,7 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   createServer as createMcpServer,
+  isReadOnlyFromEnv,
   logStderr,
   SERVER_NAME,
   SERVER_VERSION,
@@ -170,7 +171,12 @@ async function handleMcp(
       sendJson(res, 401, jsonRpcError(-32001, "API 키가 유효하지 않습니다"));
       return;
     }
-    const server = createMcpServer({ apiKey, baseUrl });
+    // read-only 는 서버 env 설정 — 클라이언트 인자로 받지 않는다.
+    const server = createMcpServer({
+      apiKey,
+      baseUrl,
+      readOnly: isReadOnlyFromEnv(),
+    });
     transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       onsessioninitialized: (newSid: string) => {
