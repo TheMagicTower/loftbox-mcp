@@ -8,6 +8,7 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   createServer,
+  isReadOnlyFromEnv,
   logStderr,
   SERVER_NAME,
   SERVER_VERSION,
@@ -33,11 +34,12 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const server = createServer({ apiKey, baseUrl, timeoutMs });
+  const readOnly = isReadOnlyFromEnv();
+  const server = createServer({ apiKey, baseUrl, timeoutMs, readOnly });
   const transport = new StdioServerTransport();
   await server.connect(transport);
   logStderr(
-    `${SERVER_NAME} v${SERVER_VERSION} 기동 (base=${baseUrl ?? "https://api.loftbox.net"}).`,
+    `${SERVER_NAME} v${SERVER_VERSION} 기동 (base=${baseUrl ?? "https://api.loftbox.net"}${readOnly ? ", read-only" : ""}).`,
   );
 }
 

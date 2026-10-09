@@ -7,7 +7,12 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 import { LoftBoxApi, ApiError } from "../src/api.js";
 import { TOOLS, guardMessage, guardPage } from "../src/tools.js";
-import { invokeTool, describeError, createServer } from "../src/server.js";
+import {
+  invokeTool,
+  describeError,
+  createServer,
+  allTools,
+} from "../src/server.js";
 
 type Handler = (req: Request) => Response | Promise<Response>;
 
@@ -127,7 +132,7 @@ describe("MCP 통합 (in-process)", () => {
     const client = new Client({ name: "test", version: "0" });
     await Promise.all([client.connect(clientT), server.connect(serverT)]);
     const { tools } = await client.listTools();
-    assert.equal(tools.length, TOOLS.length);
+    assert.equal(tools.length, allTools().length);
     for (const t of tools) {
       assert.equal((t.inputSchema as any).type, "object", `${t.name}`);
       assert.ok(t.annotations, `${t.name} annotations 없음`);

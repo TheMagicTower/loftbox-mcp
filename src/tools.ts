@@ -23,6 +23,9 @@ export interface ToolDef {
   description: string;
   inputSchema: ZodRawShape;
   annotations: ToolAnnotations;
+  /** 이 툴이 필요로 하는 API 키 fine scope(메타데이터). 403 안내에 사용.
+   *  실제 인가는 백엔드 scope/capability 게이트가 수행한다. */
+  requiredScopes?: string[];
   handler: (api: LoftBoxApi, args: Record<string, unknown>) => Promise<unknown>;
 }
 
@@ -91,16 +94,19 @@ export function guardPage(
 }
 
 /** 외부 API 호출이므로 모든 툴이 openWorld. read-only 기본 묶음. */
-const READ: ToolAnnotations = { readOnlyHint: true, openWorldHint: true };
+export const READ: ToolAnnotations = {
+  readOnlyHint: true,
+  openWorldHint: true,
+};
 /** 생성/변경(비파괴·비멱등). */
-const WRITE: ToolAnnotations = {
+export const WRITE: ToolAnnotations = {
   readOnlyHint: false,
   destructiveHint: false,
   idempotentHint: false,
   openWorldHint: true,
 };
 /** 비가역·고위험(외부 발송·발송 차단 정책/억제 추가) — codex 코드리뷰 Major. */
-const DESTRUCTIVE: ToolAnnotations = { ...WRITE, destructiveHint: true };
+export const DESTRUCTIVE: ToolAnnotations = { ...WRITE, destructiveHint: true };
 
 export const TOOLS: ToolDef[] = [
   // ─── agents ────────────────────────────────────────────────────────────
